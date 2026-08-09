@@ -3,7 +3,7 @@
 //! This compact dialect parser handles query/procedure level structure without
 //! requiring a host tree-sitter package.
 
-use intentdiff_plugin_sdk::tree::{SemanticNode, SemanticNodeBuilder};
+use intentumdiff_plugin_sdk::tree::{SemanticNode, SemanticNodeBuilder};
 
 wit_bindgen::generate!({
     path: "wit/plugin.wit",
@@ -18,7 +18,7 @@ use crate::exports::intentdiff::plugin::parser::ParserMode;
 const PLUGIN_METADATA: &str = include_str!("../plugin_metadata.info");
 
 fn language_info_for(ids: Vec<String>) -> Vec<LanguageInfoRecord> {
-    let metadata = intentdiff_plugin_sdk::metadata::parse_plugin_metadata(PLUGIN_METADATA);
+    let metadata = intentumdiff_plugin_sdk::metadata::parse_plugin_metadata(PLUGIN_METADATA);
     ids.into_iter()
         .map(|language_id| {
             let info = metadata.language_or_default(&language_id);
@@ -380,7 +380,7 @@ export!(TsqlParser);
 mod tests {
     use super::*;
     use crate::exports::intentdiff::plugin::parser::Guest;
-    use intentdiff_plugin_sdk::testing as t;
+    use intentumdiff_plugin_sdk::testing as t;
 
     #[test]
     fn grammar_id_nonempty() {
