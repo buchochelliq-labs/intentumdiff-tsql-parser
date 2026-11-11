@@ -43,7 +43,27 @@ struct TsqlParser;
 struct SourceLine {
     number: u32,
     text: String,
+    /// Normalised code: comments removed, layout whitespace outside string
+    /// literals and quoted identifiers collapsed, trailing `;` dropped.
     trimmed: String,
+    /// The line begins inside a literal/quoted identifier opened on an
+    /// earlier line, so even an empty `trimmed` is literal content.
+    starts_in_quote: bool,
+    /// The line ends inside a literal/quoted identifier, so the line break
+    /// after it is literal content.
+    ends_in_quote: bool,
+}
+
+impl SourceLine {
+    /// True when the line carries neither code nor literal content.
+    fn is_blank(&self) -> bool {
+        self.trimmed.is_empty() && !self.starts_in_quote
+    }
+
+    /// True for a `GO` batch separator line (not a `GO` inside a literal).
+    fn is_batch_separator(&self) -> bool {
+        !self.starts_in_quote && self.trimmed.eq_ignore_ascii_case("GO")
+    }
 }
 
 /// Blank out T-SQL comments (`-- ...` to end of line and nestable
@@ -136,24 +156,117 @@ fn strip_comments(source: &str) -> String {
     String::from_utf8(out).unwrap_or_default()
 }
 
-/// Collapse runs of whitespace to one space so layout changes inside a line
-/// do not leak into labels.
-fn collapse_ws(text: &str) -> String {
-    text.split_whitespace().collect::<Vec<_>>().join(" ")
+/// Closing delimiter for a quote opener: string literals (`'...'`, also the
+/// `N'...'` form, whose `N` prefix is ordinary code), double-quoted
+/// identifiers (`"..."`) and bracketed identifiers (`[...]`).
+fn quote_close(c: char) -> Option<char> {
+    match c {
+        '\'' => Some('\''),
+        '"' => Some('"'),
+        '[' => Some(']'),
+        _ => None,
+    }
+}
+
+/// Normalise one comment-free code line so layout changes do not leak into
+/// labels: outside string literals and quoted identifiers, leading/trailing
+/// whitespace is dropped, runs of whitespace collapse to one space and a
+/// trailing `;` is removed. Inside them every character is literal content
+/// and is copied verbatim (a doubled delimiter `''`, `""`, `]]` is an escape
+/// and does not close). `quote` carries an unterminated literal across lines.
+fn normalize_line(code: &str, quote: &mut Option<char>) -> String {
+    let mut out = String::with_capacity(code.len());
+    // Byte length of `out` that is literal content and must not be trimmed.
+    let mut protected = 0;
+    let mut pending_space = false;
+    let mut chars = code.chars().peekable();
+    while let Some(c) = chars.next() {
+        match *quote {
+            Some(close) => {
+                out.push(c);
+                if c == close {
+                    if chars.peek() == Some(&close) {
+                        chars.next();
+                        out.push(close);
+                    } else {
+                        *quote = None;
+                    }
+                }
+                protected = out.len();
+            }
+            None if c.is_whitespace() => pending_space = true,
+            None => {
+                if pending_space && !out.is_empty() {
+                    out.push(' ');
+                }
+                pending_space = false;
+                out.push(c);
+                if let Some(close) = quote_close(c) {
+                    *quote = Some(close);
+                    protected = out.len();
+                }
+            }
+        }
+    }
+    while out.len() > protected && (out.ends_with(';') || out.ends_with(' ')) {
+        out.pop();
+    }
+    out
 }
 
 fn lines(source: &str) -> Vec<SourceLine> {
     let code = strip_comments(source);
+    let mut quote = None;
     source
         .lines()
         .zip(code.lines())
         .enumerate()
-        .map(|(i, (text, code))| SourceLine {
-            number: i as u32,
-            text: text.to_string(),
-            trimmed: collapse_ws(code.trim().trim_end_matches(';').trim_end()),
+        .map(|(i, (text, code))| {
+            let starts_in_quote = quote.is_some();
+            let trimmed = normalize_line(code, &mut quote);
+            SourceLine {
+                number: i as u32,
+                text: text.to_string(),
+                trimmed,
+                starts_in_quote,
+                ends_in_quote: quote.is_some(),
+            }
         })
         .collect()
+}
+
+/// Split a select list on top-level commas; commas inside string literals
+/// and quoted identifiers are data. Whitespace around an item is layout
+/// unless it lies inside an (unterminated) literal.
+fn split_select_list(label: &str) -> Vec<&str> {
+    let mut items = Vec::new();
+    let mut quote: Option<char> = None;
+    let mut start = 0;
+    let mut chars = label.char_indices().peekable();
+    while let Some((i, c)) = chars.next() {
+        match quote {
+            Some(close) if c == close => {
+                if chars.peek().map(|&(_, n)| n) == Some(close) {
+                    chars.next();
+                } else {
+                    quote = None;
+                }
+            }
+            Some(_) => {}
+            None if c == ',' => {
+                items.push(label[start..i].trim());
+                start = i + 1;
+            }
+            None => quote = quote_close(c),
+        }
+    }
+    let last = label[start..].trim_start();
+    items.push(if quote.is_some() {
+        last
+    } else {
+        last.trim_end()
+    });
+    items
 }
 
 /// If `text` starts with the keyword sequence `words` (case-insensitive,
@@ -271,13 +384,16 @@ fn clause_kind(trimmed: &str) -> Option<&'static str> {
 /// (the node type carries it). For joins the join flavor is semantic and is
 /// kept as the label prefix, e.g. `LEFT JOIN orders o ON o.user_id = u.id`.
 fn clause_label(lines: &[&SourceLine], node_type: &str) -> String {
-    let mut parts = Vec::new();
+    let mut label = String::new();
+    let mut prev_ends_in_quote = false;
     for (n, line) in lines.iter().enumerate() {
+        // `trimmed` is already normalised, so whitespace right after the
+        // clause keyword is layout; anything at the end is literal content.
         let mut text = line.trimmed.clone();
         if n == 0 {
             if node_type == "join_clause" {
                 if let Some((len, flavor)) = join_prefix(&text) {
-                    let rest = text[len..].trim();
+                    let rest = text[len..].trim_start();
                     text = if rest.is_empty() {
                         flavor
                     } else {
@@ -286,37 +402,44 @@ fn clause_label(lines: &[&SourceLine], node_type: &str) -> String {
                 }
             } else if let Some((_, words)) = CLAUSES.iter().find(|(kind, _)| *kind == node_type) {
                 if let Some(len) = keyword_prefix(&text, words) {
-                    text = text[len..].trim().to_string();
+                    text = text[len..].trim_start().to_string();
                 }
             }
         }
-        let text = text.trim_end_matches(',');
-        if !text.is_empty() {
-            parts.push(text.to_string());
+        // A trailing list comma is layout, but not one inside an open literal.
+        let text = if line.ends_in_quote {
+            text.as_str()
+        } else {
+            text.trim_end_matches(',')
+        };
+        if prev_ends_in_quote {
+            // The line break is part of a multi-line literal.
+            label.push('\n');
+            label.push_str(text);
+        } else if !text.is_empty() {
+            if !label.is_empty() {
+                label.push(' ');
+            }
+            label.push_str(text);
         }
+        prev_ends_in_quote = line.ends_in_quote;
     }
-    parts.join(" ")
+    label
 }
 
 fn select_items(id: &str, label: &str, line: &SourceLine) -> Vec<SemanticNode> {
-    label
-        .split(',')
+    split_select_list(label)
+        .into_iter()
         .enumerate()
-        .filter_map(|(i, item)| {
-            let trimmed = item.trim();
-            if trimmed.is_empty() {
-                None
-            } else {
-                Some(leaf(&format!("{}.{}", id, i), "select_item", trimmed, line))
-            }
-        })
+        .filter(|(_, item)| !item.is_empty())
+        .map(|(i, item)| leaf(&format!("{}.{}", id, i), "select_item", item, line))
         .collect()
 }
 
 fn parse_select_statement(id: &str, source_lines: &[SourceLine]) -> SemanticNode {
     let nonempty: Vec<&SourceLine> = source_lines
         .iter()
-        .filter(|line| !line.trimmed.is_empty() && !line.trimmed.eq_ignore_ascii_case("GO"))
+        .filter(|line| !line.is_blank() && !line.is_batch_separator())
         .collect();
     let first = nonempty
         .first()
@@ -390,18 +513,18 @@ fn parse_routine(
 ) -> SemanticNode {
     let first = source_lines
         .iter()
-        .find(|line| !line.trimmed.is_empty())
+        .find(|line| !line.is_blank())
         .unwrap_or(&source_lines[0]);
     let last = source_lines
         .iter()
         .rev()
-        .find(|line| !line.trimmed.is_empty())
+        .find(|line| !line.is_blank())
         .unwrap_or(first);
     let label = object_name(&first.trimmed, keyword);
     let children = source_lines
         .iter()
         .enumerate()
-        .filter(|(_, line)| !line.trimmed.is_empty() && !line.trimmed.eq_ignore_ascii_case("GO"))
+        .filter(|(_, line)| !line.is_blank() && !line.is_batch_separator())
         .map(|(i, line)| leaf(&format!("{}.{}", id, i), "statement", &line.trimmed, line))
         .collect();
     SemanticNodeBuilder::new(
@@ -424,7 +547,7 @@ fn parse_routine(
 fn parse_statement_lines(id: &str, source_lines: &[SourceLine]) -> Vec<SemanticNode> {
     source_lines
         .iter()
-        .filter(|line| !line.trimmed.is_empty())
+        .filter(|line| !line.is_blank())
         .enumerate()
         .map(|(i, line)| leaf(&format!("{}.{}", id, i), "statement", &line.trimmed, line))
         .collect()
@@ -448,7 +571,7 @@ fn parse_source(source: &str) -> SemanticNode {
     // lines (already blanked by `strip_comments`) are skipped.
     let first_nonempty = source_lines
         .iter()
-        .find(|line| !line.trimmed.is_empty())
+        .find(|line| !line.is_blank())
         .map(|line| line.trimmed.as_str())
         .unwrap_or_default();
     let starts = |words: &[&str]| keyword_prefix(first_nonempty, words).is_some();
@@ -915,5 +1038,126 @@ mod tests {
     fn output_is_deterministic() {
         let src = format!("-- c\n{}", PLAYGROUND);
         assert_eq!(process_impl(&src), process_impl(&src));
+    }
+
+    // ---- PR #7 review: whitespace inside literals/quoted identifiers is data ----
+
+    fn assert_semantic(old: &str, new: &str) {
+        assert_ne!(projection(old), projection(new), "\nold: {old}\nnew: {new}");
+    }
+
+    fn assert_style_only(old: &str, new: &str) {
+        assert_eq!(projection(old), projection(new), "\nold: {old}\nnew: {new}");
+    }
+
+    #[test]
+    fn whitespace_inside_string_literal_is_semantic() {
+        // Exact pair from the review comment.
+        assert_semantic("SELECT 'a  b' AS value;\n", "SELECT 'a b' AS value;\n");
+        assert_eq!(
+            labels_of("SELECT 'a  b' AS value;\n", "select_item"),
+            vec!["'a  b' AS value"]
+        );
+        assert_semantic("SELECT 'a\tb' AS v\n", "SELECT 'a b' AS v\n");
+        assert_semantic("SELECT ' a' AS v\n", "SELECT 'a' AS v\n");
+        assert_semantic("SELECT 'a ' AS v\n", "SELECT 'a' AS v\n");
+    }
+
+    #[test]
+    fn whitespace_inside_unicode_literal_is_semantic() {
+        assert_semantic("SELECT N'a  b' AS v\n", "SELECT N'a b' AS v\n");
+        assert_eq!(
+            labels_of("SELECT N'a  b' AS v\n", "select_item"),
+            vec!["N'a  b' AS v"]
+        );
+    }
+
+    #[test]
+    fn whitespace_after_escaped_quote_stays_inside_literal() {
+        // `''` is an escaped quote, not the end of the literal.
+        assert_semantic("SELECT 'it''s  x' AS v\n", "SELECT 'it''s x' AS v\n");
+        assert_semantic("SELECT '''  ''' AS v\n", "SELECT ''' ''' AS v\n");
+    }
+
+    #[test]
+    fn whitespace_inside_bracketed_identifier_is_semantic() {
+        // Exact pair from the review comment.
+        assert_semantic(
+            "SELECT [first  name] FROM t\n",
+            "SELECT [first name] FROM t\n",
+        );
+        assert_eq!(
+            labels_of("SELECT [first  name]\nFROM t\n", "select_item"),
+            vec!["[first  name]"]
+        );
+        // `]]` is an escaped bracket, not the end of the identifier.
+        assert_semantic("SELECT [a]]  b] FROM t\n", "SELECT [a]] b] FROM t\n");
+        assert_semantic("SELECT x FROM [my  table]\n", "SELECT x FROM [my table]\n");
+    }
+
+    #[test]
+    fn whitespace_inside_double_quoted_identifier_is_semantic() {
+        assert_semantic("SELECT \"my  col\" FROM t\n", "SELECT \"my col\" FROM t\n");
+        assert_semantic(
+            "SELECT \"a\"\"  b\" FROM t\n",
+            "SELECT \"a\"\" b\" FROM t\n",
+        );
+    }
+
+    #[test]
+    fn whitespace_inside_literal_in_unmodeled_statement_is_semantic() {
+        assert_semantic(
+            "UPDATE t SET name = 'a  b' WHERE id = 1;\n",
+            "UPDATE t SET name = 'a b' WHERE id = 1;\n",
+        );
+        assert_semantic(
+            "CREATE PROCEDURE dbo.p AS\nBEGIN\n    SELECT 'x  y';\nEND\n",
+            "CREATE PROCEDURE dbo.p AS\nBEGIN\n    SELECT 'x y';\nEND\n",
+        );
+    }
+
+    #[test]
+    fn whitespace_inside_multiline_literal_is_semantic() {
+        // The literal spans lines: leading/trailing whitespace on the inner
+        // lines and the line break itself are literal content.
+        assert_semantic("SELECT 'a\n  b' AS v\n", "SELECT 'a\nb' AS v\n");
+        assert_semantic("SELECT 'a  \nb' AS v\n", "SELECT 'a\nb' AS v\n");
+        assert_semantic("SELECT 'a\nb' AS v\n", "SELECT 'a b' AS v\n");
+        // A `;` inside the literal at a line end is data.
+        assert_semantic("SELECT 'a;\nb' AS v\n", "SELECT 'a\nb' AS v\n");
+        // Blank and `GO` lines inside the literal are content, not layout.
+        assert_semantic("SELECT 'a\n\nb' AS v\n", "SELECT 'a\nb' AS v\n");
+        assert_semantic("SELECT 'a\nGO\nb' AS v\n", "SELECT 'a\nb' AS v\n");
+    }
+
+    #[test]
+    fn comma_inside_literal_does_not_split_select_items() {
+        assert_eq!(
+            labels_of("SELECT 'a,  b' AS v, c\n", "select_item"),
+            vec!["'a,  b' AS v", "c"]
+        );
+        assert_semantic("SELECT 'a,  b' AS v\n", "SELECT 'a, b' AS v\n");
+    }
+
+    #[test]
+    fn layout_outside_literals_stays_style_only() {
+        assert_style_only(
+            "SELECT 'a  b' AS value, [first  name], N'x  y', \"q  r\" FROM t;\n",
+            "SELECT   'a  b'   AS\tvalue,   [first  name],\tN'x  y',  \"q  r\"   FROM   t ;  \n",
+        );
+        assert_style_only(
+            "SELECT 'a  b' AS v\nFROM [my  t]\nWHERE x = 'p  q'\n",
+            "SELECT   'a  b'  AS  v\n   FROM  [my  t]\n\tWHERE  x  =  'p  q'   \n",
+        );
+        assert_style_only(
+            "UPDATE t SET name = 'a  b' WHERE id = 1;\n",
+            "  UPDATE   t SET  name =  'a  b'   WHERE id = 1 ;\n",
+        );
+        assert_style_only(
+            "SELECT 'it''s  x' AS v, [a]]  b]\n",
+            "SELECT    'it''s  x'   AS v,   [a]]  b]\n",
+        );
+        // Multi-line literal: layout after the literal closes is still layout.
+        assert_style_only("SELECT 'a\n  b' AS v\n", "SELECT 'a\n  b'    AS   v  \n");
     }
 }
